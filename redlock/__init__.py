@@ -46,6 +46,13 @@ class Redlock(object):
     else
         return 0
     end"""
+    extend_lock_script = """
+    if redis.call("get",KEYS[1]) == ARGV[1] then
+        return redis.call("setex", KEYS[1], ARGV[2], ARGV[1])
+    else
+        return 0
+    end
+    """
 
     def __init__(self, connection_list, retry_count=None, retry_delay=None):
         self.servers = []
@@ -68,15 +75,13 @@ class Redlock(object):
         self.retry_count = retry_count or self.default_retry_count
         self.retry_delay = retry_delay or self.default_retry_delay
 
-    def lock_instance(self, server, resource, val, ttl, nx: bool=True, xx: bool=False):
+    def lock_instance(self, server, resource, val, ttl):
         """
         SET lock in Redis master servers
         :param server: Redis server instance
         :param resource: Resource
         :param val: Unique Key to sign the lock.
         :param ttl: milliseconds -- Set the specified expire time, in milliseconds.
-        :param nx: Only set the key if it does not already exist. Default True. xx has higher priority.
-        :param xx: Only set the key if it already exist. Default False.
         :return: True if SET was executed correctly. None is returned if the SET operation was not performed
         because the user specified the `nx` or `xx` option but the condition was not met.
         """
@@ -84,9 +89,13 @@ class Redlock(object):
             assert isinstance(ttl, int), 'ttl {} is not an integer'.format(ttl)
         except AssertionError as e:
             raise ValueError(str(e))
-        if xx:  # xx has higher priority
-            nx = False
-        return server.set(resource, val, nx=nx, xx=xx, px=ttl)
+        return server.set(resource, val, nx=True, px=ttl)
+
+    def extend_lock_instance(self, server, resource, val, ttl):
+        try:
+            server.eval(self.extend_lock_script, 1, resource, val, ttl)
+        except Exception as e:
+            logging.exception("Error extend lock resource %s in server %s", resource, str(server))
 
     def unlock_instance(self, server, resource, val):
         try:
@@ -98,9 +107,13 @@ class Redlock(object):
         CHARACTERS = string.ascii_letters + string.digits
         return ''.join(random.choice(CHARACTERS) for _ in range(22)).encode()
 
-    def lock(self, resource, ttl, key=None, xx=False):
+    def lock(self, resource, ttl, key=None, extend=False):
         retry = 0
-        val = key or self.get_unique_id()
+        if extend:
+            assert key, "key should be provide to extend the lock"
+            val = key
+        else:
+            val = self.get_unique_id()
 
         # Add 2 milliseconds to the drift to account for Redis expires
         # precision, which is 1 millisecond, plus 1 millisecond min
@@ -114,7 +127,8 @@ class Redlock(object):
             del redis_errors[:]
             for server in self.servers:
                 try:
-                    if self.lock_instance(server, resource, val, ttl, xx=xx):
+                    if extend if self.extend_lock_instance(server, resource, val, ttl) \
+                            else self.lock_instance(server, resource, val, ttl):
                         n += 1
                 except RedisError as e:
                     redis_errors.append(e)
@@ -135,7 +149,7 @@ class Redlock(object):
         return False
 
     def extend_lock(self, lock: Lock, ttl: int):
-        self.lock(lock.resource, ttl, key=lock.key, xx=True)
+        self.lock(lock.resource, ttl, key=lock.key, extend=True)
 
     def unlock(self, lock):
         redis_errors = []
