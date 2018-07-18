@@ -68,12 +68,25 @@ class Redlock(object):
         self.retry_count = retry_count or self.default_retry_count
         self.retry_delay = retry_delay or self.default_retry_delay
 
-    def lock_instance(self, server, resource, val, ttl):
+    def lock_instance(self, server, resource, val, ttl, nx: bool=True, xx: bool=False):
+        """
+        SET lock in Redis master servers
+        :param server: Redis server instance
+        :param resource: Resource
+        :param val: Unique Key to sign the lock.
+        :param ttl: milliseconds -- Set the specified expire time, in milliseconds.
+        :param nx: Only set the key if it does not already exist. Default True. xx has higher priority.
+        :param xx: Only set the key if it already exist. Default False.
+        :return: True if SET was executed correctly. None is returned if the SET operation was not performed
+        because the user specified the `nx` or `xx` option but the condition was not met.
+        """
         try:
             assert isinstance(ttl, int), 'ttl {} is not an integer'.format(ttl)
         except AssertionError as e:
             raise ValueError(str(e))
-        return server.set(resource, val, nx=True, px=ttl)
+        if xx:  # xx has higher priority
+            nx = False
+        return server.set(resource, val, nx=nx, xx=xx, px=ttl)
 
     def unlock_instance(self, server, resource, val):
         try:
@@ -85,9 +98,9 @@ class Redlock(object):
         CHARACTERS = string.ascii_letters + string.digits
         return ''.join(random.choice(CHARACTERS) for _ in range(22)).encode()
 
-    def lock(self, resource, ttl):
+    def lock(self, resource, ttl, key=None, xx=False):
         retry = 0
-        val = self.get_unique_id()
+        val = key or self.get_unique_id()
 
         # Add 2 milliseconds to the drift to account for Redis expires
         # precision, which is 1 millisecond, plus 1 millisecond min
@@ -101,7 +114,7 @@ class Redlock(object):
             del redis_errors[:]
             for server in self.servers:
                 try:
-                    if self.lock_instance(server, resource, val, ttl):
+                    if self.lock_instance(server, resource, val, ttl, xx=xx):
                         n += 1
                 except RedisError as e:
                     redis_errors.append(e)
@@ -120,6 +133,9 @@ class Redlock(object):
                 retry += 1
                 time.sleep(self.retry_delay)
         return False
+
+    def extend_lock(self, lock: Lock, ttl: int):
+        self.lock(lock.resource, ttl, key=lock.key, xx=True)
 
     def unlock(self, lock):
         redis_errors = []
